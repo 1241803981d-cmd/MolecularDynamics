@@ -10,10 +10,7 @@ configurations, and post-processing scripts associated with the manuscript:
 
 LAMMPS atom types are defined as follows:
 
-| Atom type | Element |
-| 1 | Ti |
-| 2 | Si |
-| 3 | C |
+| Atom type 1.Ti 2.Si 3.C
 
 The velocity initialization value used by the input script is 4652817.
 
