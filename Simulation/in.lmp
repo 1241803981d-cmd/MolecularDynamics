@@ -1,0 +1,203 @@
+# ================================================================
+# Ti-SiC composite: cooling-rate-controlled compression workflow
+# Purpose:
+#   Keep Tstart and Tend fixed, vary only the cooling rate.
+#   Outputs global thermo, stress-strain data, interface dynamics,
+#   RDF, and atom-level structure/stress descriptors for plotting.
+# Units:
+#   dt is ps in units metal.
+#   coolRate is K/ps. 1 K/ps = 1.0e12 K/s.
+# ================================================================
+
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+# ---------------- User-controlled variables ----------------
+variable Tstart   equal 773
+variable Tend     equal 373
+variable coolRate index 1.0
+variable seed     index 4652817
+variable tag      index R1p0
+
+variable dt       equal 0.001
+variable Tdamp    equal 100*${dt}
+variable Pdamp    equal 1000*${dt}
+variable dumpEvery equal 5000
+variable aveEvery  equal 1000
+
+timestep        ${dt}
+neighbor        3.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+read_data       Ti-SiC.data
+
+# ---------------- Potential settings ----------------
+pair_style      hybrid eam/alloy vashishta morse 9.0
+
+pair_coeff      * * eam/alloy potentials/Ti.eam.alloy Ti NULL NULL
+pair_coeff      * * vashishta potentials/SiC.vashishta NULL Si C
+
+pair_coeff      1 2 morse 0.5867 1.2281 3.1935 8.0
+pair_coeff      1 3 morse 0.8293 1.4887 2.6723 7.0
+
+# ---------------- Common computes for output ----------------
+compute pe_atom all pe/atom
+compute ke_atom all ke/atom
+compute s_atom  all stress/atom NULL
+compute centro  all centro/atom 12
+compute coord   all coord/atom cutoff 3.2
+compute disp    all displace/atom
+compute rdf_all all rdf 200 1 2 1 3 2 3
+
+# Raw per-atom von Mises-like stress indicator.
+# c_s_atom has stress*volume units; use this for spatial comparison,
+# not as a direct absolute stress without volume normalization.
+variable sx atom c_s_atom[1]
+variable sy atom c_s_atom[2]
+variable sz atom c_s_atom[3]
+variable sxy atom c_s_atom[4]
+variable sxz atom c_s_atom[5]
+variable syz atom c_s_atom[6]
+variable vm_raw atom sqrt(0.5*((v_sx-v_sy)^2+(v_sy-v_sz)^2+(v_sz-v_sx)^2)+3.0*(v_sxy^2+v_sxz^2+v_syz^2))
+
+variable step  equal step
+variable tempv equal temp
+variable pev   equal pe
+variable kev   equal ke
+variable pressv equal press
+variable volv  equal vol
+variable lxv   equal lx
+variable lyv   equal ly
+variable lzv   equal lz
+
+# ================================================================
+# 1. Energy minimization
+# ================================================================
+thermo          1000
+thermo_style    custom step temp lx ly lz vol press pe ke
+dump            dump_min all custom ${dumpEvery} dump_min_${tag}.lammpstrj id type x y z c_pe_atom c_centro c_coord
+min_style       cg
+minimize        1e-15 1e-12 10000 100000
+write_data      data_min_${tag}.data
+undump          dump_min
+reset_timestep  0
+
+# ================================================================
+# 2. NPT equilibration at fixed initial temperature
+# ================================================================
+velocity        all create ${Tstart} ${seed} rot yes dist gaussian
+fix             eq all npt temp ${Tstart} ${Tstart} ${Tdamp} iso 0.0 0.0 ${Pdamp}
+fix             out_eq all print ${aveEvery} "${step} ${tempv} ${pev} ${kev} ${pressv} ${lxv} ${lyv} ${lzv} ${volv}" file thermo_equil_${tag}.dat screen no title "Step Temp PotEng KinEng Press Lx Ly Lz Volume"
+dump            dump_eq all custom ${dumpEvery} dump_equil_${tag}.lammpstrj id type x y z c_pe_atom c_centro c_coord
+
+thermo          1000
+thermo_style    custom step temp pe ke press lx ly lz vol
+run             200000
+
+write_data      data_equil_${tag}.data
+unfix           eq
+unfix           out_eq
+undump          dump_eq
+reset_timestep  0
+
+# ================================================================
+# 3. Controlled-rate NPT cooling from Tstart to Tend
+# ================================================================
+# nCool = cooling interval / (coolRate * dt)
+variable nCool equal ceil((${Tstart}-${Tend})/(${coolRate}*${dt}))
+
+fix             cool all npt temp ${Tstart} ${Tend} ${Tdamp} iso 0.0 0.0 ${Pdamp}
+fix             out_cool all print ${aveEvery} "${step} ${tempv} ${pev} ${kev} ${pressv} ${lxv} ${lyv} ${lzv} ${volv}" file thermo_cooling_${tag}.dat screen no title "Step Temp PotEng KinEng Press Lx Ly Lz Volume"
+fix             out_rdf all ave/time 100 10 1000 c_rdf_all[*] file rdf_cooling_${tag}.dat mode vector
+dump            dump_cool all custom ${dumpEvery} dump_cooling_${tag}.lammpstrj id type x y z c_pe_atom c_ke_atom c_centro c_coord c_disp[1] c_disp[2] c_disp[3] c_s_atom[1] c_s_atom[2] c_s_atom[3] c_s_atom[4] c_s_atom[5] c_s_atom[6] v_vm_raw
+
+thermo          1000
+thermo_style    custom step temp pe ke press lx ly lz vol
+run             ${nCool}
+
+write_data      data_cooled_${tag}.data
+unfix           cool
+unfix           out_cool
+unfix           out_rdf
+undump          dump_cool
+reset_timestep  0
+
+# ================================================================
+# 4. Post-cooling interface dynamics
+# ================================================================
+variable cx equal 0.5*(xlo+xhi)
+variable cy equal 0.5*(ylo+yhi)
+variable cz equal 0.5*(zlo+zhi)
+variable Rin equal 24.5
+variable Rout equal 29.5
+
+region sic_core sphere ${cx} ${cy} ${cz} ${Rin} side in units box
+region interface_outer sphere ${cx} ${cy} ${cz} ${Rout} side in units box
+
+group Ti_all type 1
+group Si_all type 2
+group C_all  type 3
+group near_particle region interface_outer
+group sic_region region sic_core
+group interface_shell subtract near_particle sic_region
+group Ti_interface intersect Ti_all interface_shell
+
+compute temp_if Ti_interface temp
+compute vacf_if Ti_interface vacf
+
+fix dyn_nvt all nvt temp ${Tend} ${Tend} ${Tdamp}
+fix out_vacf Ti_interface ave/time 5 1 5 c_vacf_if[1] c_vacf_if[2] c_vacf_if[3] c_vacf_if[4] file vacf_interface_${tag}.dat title2 "Step VACF_x VACF_y VACF_z VACF_total"
+
+run             10000
+
+unfix           dyn_nvt
+unfix           out_vacf
+uncompute       temp_if
+uncompute       vacf_if
+reset_timestep  0
+
+# ================================================================
+# 5. uniaxial compression after cooling
+# ================================================================
+fix             npt_xy all npt temp ${Tend} ${Tend} ${Tdamp} x 0.0 0.0 ${Pdamp} y 0.0 0.0 ${Pdamp} drag 2
+
+variable tmpL0 equal lz
+variable L0 equal ${tmpL0}
+fix             deform_z all deform 1 z erate -0.002 units box remap x
+
+# Positive compressive strain and stress in GPa.
+variable strain equal -(lz-v_L0)/v_L0
+compute comp_temp all temp
+compute comp_press all pressure comp_temp
+variable sxx equal -c_comp_press[1]/10000
+variable syy equal -c_comp_press[2]/10000
+variable szz equal -c_comp_press[3]/10000
+variable sxy_g equal -c_comp_press[4]/10000
+variable sxz_g equal -c_comp_press[5]/10000
+variable syz_g equal -c_comp_press[6]/10000
+variable vonmises_g equal sqrt(0.5*((v_sxx-v_syy)^2+(v_syy-v_szz)^2+(v_szz-v_sxx)^2)+3.0*(v_sxy_g^2+v_sxz_g^2+v_syz_g^2))
+
+fix out_ss all print 100 "${step} ${strain} ${szz} ${sxx} ${syy} ${sxy_g} ${sxz_g} ${syz_g} ${vonmises_g} ${tempv} ${pev} ${lxv} ${lyv} ${lzv} ${volv}" file stress_strain_${tag}.dat screen no title "Step Strain Szz_GPa Sxx_GPa Syy_GPa Sxy_GPa Sxz_GPa Syz_GPa VonMises_GPa Temp PotEng Lx Ly Lz Volume"
+dump dump_comp all custom ${dumpEvery} dump_compression_${tag}.lammpstrj id type x y z c_pe_atom c_ke_atom c_centro c_coord c_disp[1] c_disp[2] c_disp[3] c_s_atom[1] c_s_atom[2] c_s_atom[3] c_s_atom[4] c_s_atom[5] c_s_atom[6] v_vm_raw
+
+thermo          1000
+thermo_style    custom step temp v_strain v_szz v_sxx v_syy v_vonmises_g pe lx ly lz vol
+run             200000
+
+write_data      data_compressed_${tag}.data
+
+unfix           npt_xy
+unfix           deform_z
+unfix           out_ss
+undump          dump_comp
+
+# ================================================================
+# 6. Final single-frame descriptors for compact postprocessing
+# ================================================================
+dump dump_final all custom 1 atomic_features_final_${tag}.dump id type x y z c_pe_atom c_ke_atom c_centro c_coord c_disp[1] c_disp[2] c_disp[3] c_s_atom[1] c_s_atom[2] c_s_atom[3] c_s_atom[4] c_s_atom[5] c_s_atom[6] v_vm_raw
+run 0
+undump dump_final
+
+write_data      data_final_${tag}.data
