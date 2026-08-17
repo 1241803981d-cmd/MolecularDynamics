@@ -1,5 +1,5 @@
 # Ti/SiC cooling
-A repository for molecular dynamics simulations.
+A repository for LAMMPS molecular dynamics simulations.
 # Ti/SiC Cooling-Rate-Dependent Compression Data and Code
 
 This repository contains simulation inputs, numerical source data, final atomic
